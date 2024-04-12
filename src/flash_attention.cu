@@ -74,31 +74,29 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
             for (int k = 0; k < head_dim; ++k){
                 sum_ += shared_q[threadIdx.y][k] * shared_k[threadIdx.x][k];
             }
-            shared_s[threadIdx.y][threadIdx.x] = sum_; 
+            shared_s[threadIdx.y][threadIdx.x] = sum_;
+            
             __syncthreads();
             // row max
             if (threadIdx.x == 0){
                 T m_ij = 0;
                 for (int k = 0; k < bc; ++k){
-                    m_ij = max(max_, shared_s[threadIdx.y][k]);
+                    m_ij = max(m_ij, shared_s[threadIdx.y][k]);
                 }
                 // softmax
                 T l_ij = 0;
                 for (int k = 0; k < bc; ++k){
-                    shared_s[threadIdx.y][k] = exp(shared_s[threadIdx.y][k] - max_);
+                    shared_s[threadIdx.y][k] = exp(shared_s[threadIdx.y][k] - m_ij);
                     l_ij += shared_s[threadIdx.y][k];
                 }
                 // compute l and m
                 T m_new =  max(shared_m[threadIdx.y], m_ij);
-                shared_l[threadIdx.y] = exp(shared_m[threadIdx.y] - m_new) * shared_l[threadIdx.y] + exp(m_ij - m_new) * l_ij;
-                shared_m[threadIdx.y] = m_new;
+                T l_new = exp(shared_m[threadIdx.y] - m_new) * shared_l[threadIdx.y] + exp(m_ij - m_new) * l_ij;
+                // shared_l[threadIdx.y] = l_new;
+                // shared_m[threadIdx.y] = m_new;
             }
-
-            
-            
-
-
-
+            __syncthreads();
+            // compute O
 
         }
 
