@@ -26,6 +26,7 @@ import torch
 lib = ctypes.CDLL("minitorch/cuda_kernels/combine.so")
 lib_softmax = ctypes.CDLL("minitorch/cuda_kernels/softmax_kernel.so")
 lib_layernorm = ctypes.CDLL("minitorch/cuda_kernels/layernorm_kernel.so")
+lib_flash_attn = ctypes.CDLL("minitorch/cuda_kernels/flash_attention.so")
 datatype = np.float32
 
 # function map
@@ -508,4 +509,43 @@ class CudaKernelOps(TensorOps):
         )
         return inp_grad, gamma_grad, beta_grad
       #   END ASSIGN3_2
+
+    
+    @staticmethod
+    def flash_attn_fw(q: Tensor, k: Tensor, v: Tensor, is_causal:bool):
+        batch_size, nhead, seq_len, head_dim = k.shape
+        stream = torch.cuda.current_stream().cuda_stream
+        output = q.zeros(q.shape)
+
+        lib_flash_attn.launch_flash_attn_fw.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_bool,
+            ctypes.c_void_p
+        ]
+
+        lib_flash_attn.launch_flash_attn_fw.restype = None
+        lib_flash_attn.launch_flash_attn_fw(
+            q._tensor._storage,
+            k._tensor._storage,
+            v._tensor._storage,
+            output._tensor.storage,
+            batch_size,
+            nhead,
+            seq_len,
+            head_dim,
+            is_causal,
+            stream
+        )
+
+
+
+
+
       
