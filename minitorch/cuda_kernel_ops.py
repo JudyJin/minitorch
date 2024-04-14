@@ -544,6 +544,8 @@ class CudaKernelOps(TensorOps):
             stream
         )
 
+        return output
+
 
 
 
