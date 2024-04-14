@@ -192,13 +192,10 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   dim3 block_dim(bc, br);
 
   // launch kernel
-  flash_attn_fw<float><<<grid_dim, block_dim, 0, stream>>>(d_q, d_k, d_v, seq_len, head_dim,nullptr, is_causal);
-
-
-
+  flash_attn_fw<float><<<grid_dim, block_dim, 0, stream>>>(d_q, d_k, d_v, d_o, head_dim, nullptr, is_causal);
   
   // Copy back to the host
-  cudaMemcpy(inp, d_inp, inp_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(O, d_o, qkv_size, cudaMemcpyDeviceToHost);
   cudaDeviceSynchronize();
 
   // Check CUDA execution
@@ -209,9 +206,11 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   }
 
   // Free memory on device
-  cudaFree(d_inp);
-  cudaFree(d_attn_mask);
-
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_o);
+  
 }}
 
 
