@@ -18,8 +18,8 @@ def test_launch_flash_attn():
   batch_size, seq_len = kt.bs_sl()
   nhead = kt.nhead
   print(
-      "(batch_size, nhead, seq_len,"
-      f" is_dec_self_attn_infer): ({batch_size}, {nhead}, {seq_len},"
+      "(batch_size, nhead, seq_len, head_dim"
+      f"): ({batch_size}, {nhead}, {seq_len},{64}"
   )
   q = kt.rand((batch_size, nhead, seq_len, 64))
   k = kt.rand((batch_size, nhead, seq_len, 64))
@@ -31,7 +31,7 @@ def test_launch_flash_attn():
     v_mt = minitorch.tensor(v.clone().tolist(), backend=backend, requires_grad=True)
 
     start_time = time.time()
-    cust_out = q_mt.flash_attn(q_mt,k_mt,v_mt,False)
+    cust_out = q_mt.flash_attn(q_mt,k_mt,v_mt,minitorch.tensor_from_numpy(np.array(0)))
     end_time = time.time()
 
     cust_out = torch.tensor(cust_out._tensor._storage).float().cuda()

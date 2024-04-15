@@ -454,7 +454,7 @@ class LayerNorm(Function):
 
 class FlashAttn(Function):
     @staticmethod
-    def forward(ctx:Context, q: Tensor, k: Tensor, v:Tensor, is_causal: bool) ->Tensor:
+    def forward(ctx:Context, q: Tensor, k: Tensor, v:Tensor, is_causal: Tensor) ->Tensor:
         o = q.f.flash_attn_fw(q,k,v,is_causal)
         return o
 
