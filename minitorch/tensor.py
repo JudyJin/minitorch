@@ -423,6 +423,6 @@ class Tensor:
     def layernorm(self, gamma: Tensor, beta: Tensor) -> Tensor:
       return LayerNorm.apply(self, gamma, beta)
     
-    def flash_attn(self, q: Tensor,k:Tensor,v:Tensor,is_causal:bool)-> Tensor:
-        return FlashAttn.apply(self, q,k,v,is_causal)
+    def flash_attn(self, q: Tensor,k:Tensor,v:Tensor,is_causal:Tensor)-> Tensor:
+        return FlashAttn.apply(q,k,v,is_causal)
 
