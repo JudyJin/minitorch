@@ -546,6 +546,9 @@ class CudaKernelOps(TensorOps):
 
         return output
 
+    @staticmethod
+    def flash_attn_bw(q):
+        return q
 
 
 
