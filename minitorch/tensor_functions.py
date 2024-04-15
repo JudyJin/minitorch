@@ -452,6 +452,11 @@ class LayerNorm(Function):
         return inp.f.layernorm_bw(out_grad, inp, gamma, beta, var, mean)
       #   END ASSIGN3_2
 
+class FlashAttn(Function):
+    @staticmethod
+    def forward(ctx:Context, q: Tensor, k: Tensor, v:Tensor, is_causal: bool) ->Tensor:
+        o = q.f.flash_attn_fw(q,k,v,is_causal)
+        return o
 
 # Helpers for Constructing tensors
 def zeros(shape: UserShape, backend: TensorBackend = SimpleBackend) -> Tensor:

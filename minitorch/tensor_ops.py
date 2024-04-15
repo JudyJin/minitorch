@@ -99,6 +99,9 @@ class TensorBackend:
         self.layernorm_fw = ops.layernorm_fw
         self.layernorm_bw = ops.layernorm_bw
 
+        # Flash Attention
+        self.flash_attn_fw = ops.flash_attn_fw
+        self.flash_attn_bw = ops.flash_attn_bw
 
 class SimpleOps(TensorOps):
     @staticmethod
@@ -241,12 +244,19 @@ class SimpleOps(TensorOps):
       raise NotImplementedError("Not implemented in this assignment")
 
     @staticmethod
-    def layernorm_fw(inp: tensor):
+    def layernorm_fw(inp: Tensor):
       raise NotImplementedError("Not implemented in this assignment")
 
     @staticmethod
     def layernorm_bw():
       raise NotImplementedError("Not implemented in this assignment")
+    
+    def flash_attn_fw(q:Tensor, k:Tensor, v:Tensor, is_causal:bool):
+        raise NotImplementedError("Not implemented for flashattn")
+
+    def flash_attn_bw():
+        raise NotImplementedError("Not implemented for flashattn")
+        
 
     is_cuda = False
 
