@@ -8,6 +8,8 @@ sys.path.append('/home/zhaojin/minitorch')  # Adjust path as necessary
 from test_utils import TestDecorator
 kt = TestDecorator()
 
+torch.manual_seed(41)
+
 import minitorch
 from minitorch.cuda_kernel_ops import CudaKernelOps
 backend = minitorch.TensorBackend(CudaKernelOps)
