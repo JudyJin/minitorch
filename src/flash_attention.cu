@@ -76,7 +76,7 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
         // inner loop
         for (int i = 0;i<inner_steps;++i){
             //load Q to on-chip memory
-            int qo_per_thread = (head_dim + br -1) / br;
+            int qo_per_thread = (head_dim + bc -1) / bc;
             for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
                 int ele_idx = threadIdx.x * qo_per_thread + col_idx;
                 if (ele_idx < head_dim){
