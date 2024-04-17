@@ -512,7 +512,7 @@ class CudaKernelOps(TensorOps):
 
     
     @staticmethod
-    def flash_attn_fw(q: Tensor, k: Tensor, v: Tensor, is_causal:bool):
+    def flash_attn_fw(q: Tensor, k: Tensor, v: Tensor, is_causal:Tensor):
         batch_size, nhead, seq_len, head_dim = k.shape
         stream = torch.cuda.current_stream().cuda_stream
         output = q.zeros(q.shape)
@@ -529,21 +529,27 @@ class CudaKernelOps(TensorOps):
             ctypes.c_bool,
             ctypes.c_void_p
         ]
+        is_causal_bool = is_causal.to_numpy().astype(bool)
 
         lib_flash_attn.launch_flash_attn_fw.restype = None
         lib_flash_attn.launch_flash_attn_fw(
             q._tensor._storage,
             k._tensor._storage,
             v._tensor._storage,
-            output._tensor.storage,
+            output._tensor._storage,
             batch_size,
             nhead,
             seq_len,
             head_dim,
-            is_causal,
+            is_causal_bool,
             stream
         )
 
+        return output
+
+    @staticmethod
+    def flash_attn_bw(q):
+        return q
 
 
 
