@@ -145,12 +145,12 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
                         sum_pv += shared_s[threadIdx.y * bc + k] * shared_v[k * head_dim + ele_idx];
                     }
                     sum_pv *= factor_pv;
-                    if (j>0){
-                        T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
-                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
+                    if (j==0){
+                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_pv; // no previous O and normalization for pv
                     }
                     else{
-                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_pv; // no previous O and normalization for pv
+                        T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
+                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
                     }
                 }
             }
@@ -243,6 +243,8 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   cudaFree(d_k);
   cudaFree(d_v);
   cudaFree(d_o);
+  cudaFree(d_l);
+  cudaFree(d_m);
   
 }}
 
