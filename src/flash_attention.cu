@@ -61,7 +61,7 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
     T* shared_m_new = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_s = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
 
-
+    // TODO: 1. Consider the case where j=0,e.g., no previous blocks are computed
     for (int j=0;j<outer_steps;++j){
         // load KV to on-chip memory
         int kv_per_thread = (head_dim + br -1) / br;
@@ -84,8 +84,8 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
                 }
             }
             // always true for threadIdx.y < bc
-            // load l and m to on-chip memory
-            if (threadIdx.x == 0){
+            // load l and m to on-chip memory only when j > 0
+            if (threadIdx.x == 0 && j > 0){
                 shared_l[threadIdx.y] = L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)]; 
                 shared_m[threadIdx.y] = M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)];
             }
@@ -95,13 +95,13 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
             for (int k = 0; k < head_dim; ++k){
                 sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
             }
-            shared_s[threadIdx.y * bc + threadIdx.x] = sum_;
+            shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
             
             __syncthreads();
 
             // row-wise computation for the normalization factors
             if (threadIdx.x == 0){
-                T m_ij_ = 0;
+                T m_ij_ = -FLT_MAX; // need to be -inf
                 for (int k = 0; k < bc; ++k){
                     m_ij_ = fmaxf(m_ij_, shared_s[threadIdx.y * bc + k]);
                 }
@@ -112,11 +112,18 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
                     shared_s[threadIdx.y * bc + k] = __expf(shared_s[threadIdx.y * bc + k] - m_ij_);
                     l_ij_ += shared_s[threadIdx.y * bc + k];
                 }
-                shared_l_ij[threadIdx.y] = l_ij_;
+                shared_l_ij[threadIdx.y] = l_ij_; //Todo: the shared memory for lij is is actually not needed
 
                 // compute l_new and m_new
-                T m_new_ = fmaxf(shared_m[threadIdx.y], m_ij_);
-                T l_new_ = __expf(shared_m[threadIdx.y] - m_new_) * shared_l[threadIdx.y] + __expf(m_ij_ - m_new_) * l_ij_;
+                T m_new_, l_new_;
+                if (j==0){
+                    m_new_ = m_ij_;
+                    l_new_ = l_ij_;
+                }
+                else{
+                    T m_new_ = fmaxf(shared_m[threadIdx.y], m_ij_);
+                    T l_new_ = __expf(shared_m[threadIdx.y] - m_new_) * shared_l[threadIdx.y] + __expf(m_ij_ - m_new_) * l_ij_;
+                }
                 
                 // need to write back to shared_memory for row sharing
                 shared_l_new[threadIdx.y] = l_new_;
@@ -138,8 +145,13 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
                         sum_pv += shared_s[threadIdx.y * bc + k] * shared_v[k * head_dim + ele_idx];
                     }
                     sum_pv *= factor_pv;
-                    T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
-                    shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
+                    if (j>0){
+                        T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
+                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
+                    }
+                    else{
+                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_pv; // no previous O and normalization for pv
+                    }
                 }
             }
             __syncthreads();
@@ -183,6 +195,8 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   cudaMalloc((void **)&d_o, qkv_size);
   cudaMalloc((void **)&d_l, lm_size);
   cudaMalloc((void **)&d_m, lm_size);
+//   cudaMemset(d_l, 0, lm_size);
+//   cudaMemset(d_m, 0, lm_size);
 
 
   cudaMemcpy(d_q, Q, qkv_size, cudaMemcpyHostToDevice);
@@ -209,7 +223,7 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
 
   // launch kernel
   int total_shared_mem_size = ((br * 2 + bc * 2) * head_dim + br * 6 + br * bc) * float_size;
-  printf("get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", M, br,head_dim, total_shared_mem_size);
+  printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", M, br,head_dim, total_shared_mem_size);
 
   flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
   
