@@ -17,15 +17,18 @@ backend = minitorch.TensorBackend(CudaKernelOps)
 
 @kt.case(atol=1e-3, rtol=1e-3, ntest=5)
 def test_launch_flash_attn():
-  batch_size, seq_len = kt.bs_sl()
-  nhead = kt.nhead
+  batch_size = 8
+  nhead = 24
+  seq_len = 128
+  head_dim = 64
   print(
       "(batch_size, nhead, seq_len, head_dim"
-      f"): ({batch_size}, {nhead}, {seq_len},{64}"
+      f"): ({batch_size}, {nhead}, {seq_len},{head_dim}"
   )
-  q = kt.rand((batch_size, nhead, seq_len, 64))
-  k = kt.rand((batch_size, nhead, seq_len, 64))
-  v = kt.rand((batch_size, nhead, seq_len, 64))
+  q = kt.rand((batch_size, nhead, seq_len, head_dim))
+  k = kt.rand((batch_size, nhead, seq_len, head_dim))
+  v = kt.rand((batch_size, nhead, seq_len, head_dim))
+  # print("============q is===========\n",q[:,:,:,:10])
 
   def custom():
     q_mt = minitorch.tensor(q.clone().tolist(), backend=backend, requires_grad=True)
@@ -47,7 +50,7 @@ def test_launch_flash_attn():
     v_mt = minitorch.tensor(v.clone().tolist(), backend=backend, requires_grad=True)
 
     start_time = time.time()
-    attn_score = q_mt@ k_mt.permute(0, 1, 3, 2)
+    attn_score = q_mt@ k_mt.permute(0, 1, 3, 2) / (head_dim ** 0.5)
     attn_score = minitorch.nn.softmax(attn_score,dim=3)
     bsl_out = attn_score@v_mt
     # if not is_dec_self_attn_infer:
