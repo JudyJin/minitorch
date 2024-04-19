@@ -122,8 +122,8 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
                     l_new_ = l_ij_;
                 }
                 else{
-                    T m_new_ = fmaxf(shared_m[threadIdx.y], m_ij_);
-                    T l_new_ = __expf(shared_m[threadIdx.y] - m_new_) * shared_l[threadIdx.y] + __expf(m_ij_ - m_new_) * l_ij_;
+                    m_new_ = fmaxf(shared_m[threadIdx.y], m_ij_);
+                    l_new_ = __expf(shared_m[threadIdx.y] - m_new_) * shared_l[threadIdx.y] + __expf(m_ij_ - m_new_) * l_ij_;
                 }
                 
                 // need to write back to shared_memory for row sharing
