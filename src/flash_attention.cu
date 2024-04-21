@@ -60,13 +60,14 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
     T* shared_m_ij = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_m_new = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_s = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
+
+    // TODO: 1. Consider the case where j=0,e.g., no previous blocks are computed
     for (int j=0;j<outer_steps;++j){
-        int row_KV = (j * bc + threadIdx.x);
         // load KV to on-chip memory
         int kv_per_thread = (head_dim + br -1) / br;
         for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
             int ele_idx = threadIdx.y * kv_per_thread + col_idx;
-            if (row_KV < seq_len && ele_idx < head_dim){
+            if (ele_idx < head_dim){
                 shared_k[threadIdx.x * head_dim + ele_idx] = K[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
                 shared_v[threadIdx.x * head_dim + ele_idx] = V[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
             }
@@ -74,49 +75,43 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
         __syncthreads();
         // inner loop
         for (int i = 0;i<inner_steps;++i){
-            int row_QO = (i * br + threadIdx.y);
-            //load QO to on-chip memory
+            //load Q to on-chip memory
             int qo_per_thread = (head_dim + bc -1) / bc;
             for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
                 int ele_idx = threadIdx.x * qo_per_thread + col_idx;
-                if (row_QO < seq_len && ele_idx < head_dim){
+                if (ele_idx < head_dim){
                     shared_q[threadIdx.y * head_dim + ele_idx] = Q[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
                     shared_o[threadIdx.y * head_dim + ele_idx] = O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
                 }
             }
             // always true for threadIdx.y < bc
             // load l and m to on-chip memory only when j > 0
-            if (row_QO < seq_len && threadIdx.x == 0 && j > 0){
+            if (threadIdx.x == 0 && j > 0){
                 shared_l[threadIdx.y] = L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)]; 
                 shared_m[threadIdx.y] = M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)];
             }
             __syncthreads();
             // compute attention
-            if (row_KV < seq_len && row_QO < seq_len){
-                T sum_ = 0;
-                for (int k = 0; k < head_dim; ++k){
-                    sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
-                }
-                shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
+            T sum_ = 0;
+            for (int k = 0; k < head_dim; ++k){
+                sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
             }
+            shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
+            
             __syncthreads();
 
             // row-wise computation for the normalization factors
-            if (row_QO < seq_len && threadIdx.x == 0){
+            if (threadIdx.x == 0){
                 T m_ij_ = -FLT_MAX; // need to be -inf
                 for (int k = 0; k < bc; ++k){
-                   if ((j * bc + k) < seq_len){
-                        m_ij_ = fmaxf(m_ij_, shared_s[threadIdx.y * bc + k]);
-                   }
+                    m_ij_ = fmaxf(m_ij_, shared_s[threadIdx.y * bc + k]);
                 }
                 shared_m_ij[threadIdx.y] = m_ij_;
                 // softmax
                 T l_ij_ = 0;
                 for (int k = 0; k < bc; ++k){
-                    if ((j * bc + k) < seq_len){
-                        shared_s[threadIdx.y * bc + k] = __expf(shared_s[threadIdx.y * bc + k] - m_ij_);
-                        l_ij_ += shared_s[threadIdx.y * bc + k];
-                    }
+                    shared_s[threadIdx.y * bc + k] = __expf(shared_s[threadIdx.y * bc + k] - m_ij_);
+                    l_ij_ += shared_s[threadIdx.y * bc + k];
                 }
                 shared_l_ij[threadIdx.y] = l_ij_; //Todo: the shared memory for lij is is actually not needed
 
@@ -143,41 +138,34 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
             // step 1: compute the shared_o
             T factor_o = shared_l[threadIdx.y] * __expf(shared_m[threadIdx.y] - shared_m_new[threadIdx.y]) / shared_l_new[threadIdx.y];
             T factor_pv = __expf(shared_m_ij[threadIdx.y] - shared_m_new[threadIdx.y]) / shared_l_new[threadIdx.y];
-            if (row_QO < seq_len){
-                for (int col_idx = 0;col_idx<qo_per_thread; ++col_idx){
-                    int ele_idx = threadIdx.x * qo_per_thread + col_idx;
-                    if (ele_idx < head_dim){
-                        T sum_pv = 0;
-                        for (int k = 0; k<bc; ++k){
-                            if ((j * bc + k) < seq_len){
-                                sum_pv += shared_s[threadIdx.y * bc + k] * shared_v[k * head_dim + ele_idx];
-                            }
-                        }
-                        sum_pv *= factor_pv;
-                        if (j==0){
-                            shared_o[threadIdx.y * head_dim + ele_idx] = sum_pv; // no previous O and normalization for pv
-                        }
-                        else{
-                            T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
-                            shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
-                        }
+            for (int col_idx = 0;col_idx<qo_per_thread; ++col_idx){
+                int ele_idx = threadIdx.x * qo_per_thread + col_idx;
+                if (ele_idx < head_dim){
+                    T sum_pv = 0;
+                    for (int k = 0; k<bc; ++k){
+                        sum_pv += shared_s[threadIdx.y * bc + k] * shared_v[k * head_dim + ele_idx];
+                    }
+                    sum_pv *= factor_pv;
+                    if (j==0){
+                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_pv; // no previous O and normalization for pv
+                    }
+                    else{
+                        T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
+                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
                     }
                 }
             }
-            
             __syncthreads();
 
             // step 2: write O back to HBM
-            if (row_QO < seq_len){
-                for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
-                    int ele_idx = threadIdx.x * qo_per_thread + col_idx;
-                    if (ele_idx < head_dim){
-                        O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx] = shared_o[threadIdx.y * head_dim + ele_idx];
-                    }
+            for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
+                int ele_idx = threadIdx.x * qo_per_thread + col_idx;
+                if (ele_idx < head_dim){
+                    O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx] = shared_o[threadIdx.y * head_dim + ele_idx];
                 }
             }
             // step 3: write l, m back to HBM
-            if (row_QO < seq_len && threadIdx.x==0){
+            if (threadIdx.x==0){
                 L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)] = shared_l_new[threadIdx.y];
                 M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)] = shared_m_new[threadIdx.y];
             }
@@ -187,7 +175,6 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
     }
 
 }
-    
 
 extern "C" {
 void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float * O, 
@@ -235,7 +222,7 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
 
   // launch kernel
   int total_shared_mem_size = ((br * 2 + bc * 2) * head_dim + br * 6 + br * bc) * float_size;
-//   printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", M, br,head_dim, total_shared_mem_size);
+  printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", M, br,head_dim, total_shared_mem_size);
 
   flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
   
@@ -261,6 +248,133 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
 }}
 
 
+template <typename T>
+__global__ void flash_attn_bw(T* dO, const T *Q, const T* K, const T* V, T* O, T* L, T* M, int seq_len, int head_dim,const T * masks, bool is_causal) {
+    // flash attention bw function
+    int batch_id = blockIdx.y;
+    int head_id = blockIdx.x;
+    int batch_size = gridDim.y;
+    int nhead = gridDim.x;
+    int br = blockDim.y;
+    int bc = blockDim.x;
+    int outer_steps = (seq_len + bc - 1) / bc;
+    int inner_steps = (seq_len + br - 1) / br;
+    
+    int stride_batch = nhead * seq_len * head_dim;
+    int stride_head = seq_len * head_dim;
+    int stride_seq = head_dim;
+    // initialize dQ, dK, dV to 0
+    T *dQ = new T[batch_size * nhead * seq_len * head_dim];
+    T *dK = new T[batch_size * nhead * seq_len * head_dim];
+    T *dV = new T[batch_size * nhead * seq_len * head_dim];
+
+    extern __shared__ T shared_mem[];
+    T *shared_mem_start =  reinterpret_cast<T*>(shared_mem);
+    int ptr_bias = 0;
+    T* shared_q = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * head_dim); // size of (br * head_dim)
+    T* shared_k = GetSharedPtr<T>(shared_mem_start, &ptr_bias, bc * head_dim); // size of (bc * head_dim)
+    T* shared_v = GetSharedPtr<T>(shared_mem_start, &ptr_bias, bc * head_dim); // size of (bc * head_dim)
+    T* shared_o = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * head_dim); // size of (br * head_dim)
+    T* shared_dq = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * head_dim); // size of (br * head_dim)
+    T* shared_dk = GetSharedPtr<T>(shared_mem_start, &ptr_bias, bc * head_dim); // size of (bc * head_dim)
+    T* shared_dv = GetSharedPtr<T>(shared_mem_start, &ptr_bias, bc * head_dim); // size of (bc * head_dim)
+    T* shared_do = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * head_dim); // size of (br * head_dim)
+    T* shared_l = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
+    T* shared_m = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
+    T* shared_s = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
+    T* shared_p = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
+    T* shared_ds = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
+    T* shared_dp = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
+    T* shared_d = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
+
+    for (int j=0;j<outer_steps;++j){
+        // load KV to on-chip memory
+        // initialize dk, dv = 0 in shared memory
+        
+        int kv_per_thread = (head_dim + br -1) / br;
+        for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
+            int ele_idx = threadIdx.y * kv_per_thread + col_idx;
+            if (ele_idx < head_dim){
+                shared_k[threadIdx.x * head_dim + ele_idx] = K[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
+                shared_v[threadIdx.x * head_dim + ele_idx] = V[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
+                shared_dk[threadIdx.x * head_dim + ele_idx] = 0;
+                shared_dv[threadIdx.x * head_dim + ele_idx] = 0;
+            }
+        }
+        __syncthreads();
+        // inner loop
+        for (int i = 0;i<inner_steps;++i){
+            //load Q to on-chip memory
+            int qo_per_thread = (head_dim + bc -1) / bc;
+            for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
+                int ele_idx = threadIdx.x * qo_per_thread + col_idx;
+                if (ele_idx < head_dim){
+                    shared_q[threadIdx.y * head_dim + ele_idx] = Q[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
+                    shared_o[threadIdx.y * head_dim + ele_idx] = O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
+                    shared_dq[threadIdx.y * head_dim + ele_idx] = 0;
+                    shared_do[threadIdx.y * head_dim + ele_idx] = dO[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
+                }
+            }
+            // always true for threadIdx.y < bc
+            // load l and m to on-chip memory only when j > 0
+            if (threadIdx.x == 0 && j > 0){
+                shared_l[threadIdx.y] = L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)]; 
+                shared_m[threadIdx.y] = M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)];
+            }
+            __syncthreads();
+            // compute attention
+            T sum_ = 0;
+            for (int k = 0; k < head_dim; ++k){
+                sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
+            }
+            shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
+            
+            __syncthreads();
+
+            // TODO: Add mask
+
+            // calculate p
+            shared_p[threadIdx.y * bc + threadIdx.x] = __expf(shared_s[threadIdx.y * bc + threadIdx.x] - shared_m[threadIdx.y]) / shared_l[threadIdx.y];
+
+            // TODO: Add dropout
+
+            // calcluate dv
+            for (int k = 0; k < head_dim; ++k){
+                shared_dv[threadIdx.x * head_dim + k] += shared_d[threadIdx.y * head_dim + k] * shared_p[threadIdx.y * bc + threadIdx.x]; //* rsqrtf(head_dim);
+            }
+            // calcluate dp
+            shared_dp[threadIdx.y * bc + threadIdx.x] = shared_do[threadIdx.y * head_dim + threadIdx.x] * shared_v[threadIdx.x * head_dim + threadIdx.y];  //rsqrtf(head_dim) *
+            __syncthreads();
+
+            // calculate d, rowsum do*o
+            T sum_d = 0;
+            for (int k = 0; k < bc; ++k){
+                sum_d += shared_do[threadIdx.y * head_dim + k] * shared_o[threadIdx.y * head_dim + k];
+            }
+            shared_d[threadIdx.y] = sum_d;
+            // calculate ds
+            shared_ds[threadIdx.y * bc + threadIdx.x] = shared_p[threadIdx.y * bc + threadIdx.x] * (shared_dp[threadIdx.y * bc + threadIdx.x] - shared_d[threadIdx.y]);
+
+            __syncthreads();
+            // calculate dq
+            for (int k = 0; k < head_dim; ++k){
+                shared_dq[threadIdx.y * head_dim + k] += shared_ds[threadIdx.y * bc + threadIdx.x] * shared_k[threadIdx.x * head_dim + k] * rsqrtf(head_dim);
+            }
+            // calculate dk
+            for (int k = 0; k < head_dim; ++k){
+                shared_dk[threadIdx.x * head_dim + k] += shared_ds[threadIdx.y * bc + threadIdx.x] * shared_q[threadIdx.y * head_dim + k] * rsqrtf(head_dim);
+            }
+            __syncthreads();
+        // write back to global memory, dv, dk
+        for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
+            int ele_idx = threadIdx.y * kv_per_thread + col_idx;
+            if (ele_idx < head_dim){
+                dV[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx] = shared_dv[threadIdx.x * head_dim + ele_idx];
+                dK[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx] = shared_dk[threadIdx.x * head_dim + ele_idx];
+            }
+        }
+        __syncthreads();
+}
     
 }
 }
