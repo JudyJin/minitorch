@@ -3,7 +3,7 @@ import time
 
 import torch
 import sys
-sys.path.append('/home/zhaojin/minitorch')  # Adjust path as necessary
+sys.path.append('./')  # Adjust path as necessary
 
 from test_utils import TestDecorator
 kt = TestDecorator()
@@ -17,10 +17,10 @@ backend = minitorch.TensorBackend(CudaKernelOps)
 
 @kt.case(atol=1e-3, rtol=1e-3, ntest=5)
 def test_launch_flash_attn():
-  batch_size = 8
-  nhead = 24
-  seq_len = 128
-  head_dim = 64
+  batch_size = 128
+  nhead = 8
+  seq_len = 256
+  head_dim = 16
   print(
       "(batch_size, nhead, seq_len, head_dim"
       f"): ({batch_size}, {nhead}, {seq_len},{head_dim}"
@@ -28,6 +28,7 @@ def test_launch_flash_attn():
   q = kt.rand((batch_size, nhead, seq_len, head_dim))
   k = kt.rand((batch_size, nhead, seq_len, head_dim))
   v = kt.rand((batch_size, nhead, seq_len, head_dim))
+  mask_zero = kt.zeros((batch_size, nhead, seq_len,seq_len))
   # print("============q is===========\n",q[:,:,:,:10])
 
   def custom():
@@ -51,7 +52,9 @@ def test_launch_flash_attn():
 
     start_time = time.time()
     attn_score = q_mt@ k_mt.permute(0, 1, 3, 2) / (head_dim ** 0.5)
-    attn_score = minitorch.nn.softmax(attn_score,dim=3)
+    mask = minitorch.zeros_tensor_from_numpy(shape=(batch_size,seq_len),backend=backend)
+    attn_score = attn_score.attn_softmax(mask)
+    # attn_score = minitorch.nn.softmax(attn_score,dim=3)
     bsl_out = attn_score@v_mt
     # if not is_dec_self_attn_infer:
     #   res = minitorch.nn.softmax(inp_mt + mask_mt, dim=3)
