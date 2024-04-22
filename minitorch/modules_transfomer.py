@@ -20,7 +20,7 @@ datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False, use_flash: bool=False):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -51,6 +51,7 @@ class MultiHeadAttention(Module):
         self.out_projection = Linear(n_embd, n_embd, bias, backend)
         self.dropout = Dropout(p_dropout)
         self.use_fused_kernel = use_fused_kernel
+        self.use_flash = use_flash
 
     def create_causal_mask(self, bs, nh, seq_len):
         """
@@ -105,7 +106,13 @@ class MultiHeadAttention(Module):
         assert q_dim == k_dim == v_dim
         result = None
         
-        if not self.use_fused_kernel:
+        if self.use_flash:
+            print("Use flash")
+            k = kT.permute(0, 1, 3, 2)
+            result = q.flash_attn(q,k,v,tensor_from_numpy(np.array(0)))
+            result.permute(0, 2, 1, 3).contiguous().view(batch_size, queries_len, self.n_head * self.attn_hidden_dim)
+
+        elif not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             qk = q @ kT
             result = qk / self.attn_hidden_dim ** 0.5
@@ -194,7 +201,7 @@ class FeedForward(Module):
         return x
 
 class TransformerLayer(Module):
-    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-8, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False):
+    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-8, bias: bool=True, backend: TensorBackend=None, use_fused_kernel: bool=False, use_flash:bool=False):
         super().__init__()
         """A Transformer Layer in a Pre-LN Transformer.
 
@@ -216,10 +223,11 @@ class TransformerLayer(Module):
         # self.attention
         # self.ff
         
-        self.attention = MultiHeadAttention(n_embd, n_head, p_dropout=p_dropout, bias=bias, backend=backend, use_fused_kernel=use_fused_kernel)
+        self.attention = MultiHeadAttention(n_embd, n_head, p_dropout=p_dropout, bias=bias, backend=backend, use_fused_kernel=use_fused_kernel, use_flash=use_flash)
         self.ff = FeedForward(n_embd, p_dropout=p_dropout, bias=bias, backend=backend)
 
         self.use_fused_kernel = use_fused_kernel
+        self.use_flash = use_flash
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             self.ln_1 = LayerNorm1d(n_embd, ln_eps, backend)
@@ -273,6 +281,7 @@ class DecoderLM(Module):
         bias: bool=True,
         backend: TensorBackend=None,
         use_fused_kernel: bool=False,
+        use_flash: bool=False
     ):
         super().__init__()
         """A Full Decoder-only Pre-LN Transformer with 4 Transformer Layers.
@@ -312,15 +321,16 @@ class DecoderLM(Module):
         # self.lm_head             = 
         self.token_embeddings    = Embedding(n_vocab, n_embd, backend)
         self.position_embeddings = Embedding(n_positions, n_embd, backend)
-        self.t_layer_1           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel)
-        self.t_layer_2           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel)
-        self.t_layer_3           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel)
-        self.t_layer_4           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel)
+        self.t_layer_1           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel, use_flash)
+        self.t_layer_2           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel, use_flash)
+        self.t_layer_3           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel, use_flash)
+        self.t_layer_4           = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend, use_fused_kernel, use_flash)
         self.dropout             = Dropout(p_dropout)
         self.lm_head             = Linear(n_embd, n_vocab, bias, backend)
         
 
         self.use_fused_kernel = use_fused_kernel
+        self.use_flash = use_flash
         if not self.use_fused_kernel:
             # COPY FROM ASSIGN2_4
             self.ln = LayerNorm1d(n_embd, ln_eps, backend)

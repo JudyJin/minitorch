@@ -9,6 +9,8 @@ import datasets
 import numpy as np
 import argparse
 from distutils.util import strtobool
+import sys
+sys.path.append('/home/zhaojin/wzr/minitorch')  # Adjust path as necessary
 
 from sacrebleu.metrics import BLEU
 from transformers import AutoTokenizer
@@ -214,6 +216,7 @@ def parse_args():
         
     parser = argparse.ArgumentParser()
     parser.add_argument('--use-fused-kernel', type=str2bool, default=False)
+    parser.add_argument("--use-flash",type=str2bool, default=False)
     return parser.parse_args()
 
 
@@ -226,7 +229,8 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
          n_vocab=10000,
          n_embd=128,
          seed=11111,
-         use_fused_kernel=False):
+         use_fused_kernel=False,
+         use_flash = False):
     args = parse_args()
 
     start_time = time.time()
@@ -248,7 +252,8 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
         'p_dropout'   : 0.1,  # x_pdrop
         'ln_eps'      : 1e-5, # layer_norm_epsilon
         'backend'     : backend,
-        'use_fused_kernel': args.use_fused_kernel
+        'use_fused_kernel': args.use_fused_kernel, 
+        'use_flash': args.use_flash
     }
 
     model = DecoderLM(**config)
