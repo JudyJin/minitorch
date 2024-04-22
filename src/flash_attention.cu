@@ -178,6 +178,7 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
 
 extern "C" {
 void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float * O, 
+                                float *L, float *M,
                                 int batch_size, int nhead, int seq_len, int head_dim,
                                 bool is_causal,
                                 cudaStream_t stream) {
@@ -187,7 +188,7 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   int lm_size = batch_size * nhead * seq_len * float_size;
 
   float *d_q, *d_k, *d_v, *d_o;
-  float * d_l, *d_m;
+  float *d_l, *d_m;
   cudaMalloc((void **)&d_q, qkv_size);
   cudaMalloc((void **)&d_k, qkv_size);
   cudaMalloc((void **)&d_v, qkv_size);
@@ -210,19 +211,19 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   int deviceId;
   cudaGetDevice(&deviceId);
   cudaGetDeviceProperties(&prop, deviceId);
-  int M = prop.sharedMemPerBlock;
+  int Mem = prop.sharedMemPerBlock;
 
   // calculate block size
   int bc, br;
-  bc = min(M/(4*head_dim), 16);
-  br = min(M/(4*head_dim), 16);
+  bc = min(Mem/(4*head_dim), 16);
+  br = min(Mem/(4*head_dim), 16);
 
 
   dim3 block_dim(bc, br);
 
   // launch kernel
   int total_shared_mem_size = ((br * 2 + bc * 2) * head_dim + br * 6 + br * bc) * float_size;
-  printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", M, br,head_dim, total_shared_mem_size);
+  printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
 
   flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
   
@@ -236,6 +237,8 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   }
   // Copy back to the host
   cudaMemcpy(O, d_o, qkv_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(L, d_l, lm_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(M, d_m, lm_size, cudaMemcpyDeviceToHost);
 
   // Free memory on device
   cudaFree(d_q);
@@ -244,12 +247,13 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   cudaFree(d_o);
   cudaFree(d_l);
   cudaFree(d_m);
+
   
 }}
 
 
 template <typename T>
-__global__ void flash_attn_bw(T* dO, const T *Q, const T* K, const T* V, T* O, T* L, T* M, int seq_len, int head_dim,const T * masks, bool is_causal) {
+__global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, const T* K, const T* V, const T* O, const T* L, const T* M, int seq_len, int head_dim,const T * masks, bool is_causal) {
     // flash attention bw function
     int batch_id = blockIdx.y;
     int head_id = blockIdx.x;
@@ -264,9 +268,9 @@ __global__ void flash_attn_bw(T* dO, const T *Q, const T* K, const T* V, T* O, T
     int stride_head = seq_len * head_dim;
     int stride_seq = head_dim;
     // initialize dQ, dK, dV to 0
-    T *dQ = new T[batch_size * nhead * seq_len * head_dim];
-    T *dK = new T[batch_size * nhead * seq_len * head_dim];
-    T *dV = new T[batch_size * nhead * seq_len * head_dim];
+    // T *dQ = new T[batch_size * nhead * seq_len * head_dim];
+    // T *dK = new T[batch_size * nhead * seq_len * head_dim];
+    // T *dV = new T[batch_size * nhead * seq_len * head_dim];
 
     extern __shared__ T shared_mem[];
     T *shared_mem_start =  reinterpret_cast<T*>(shared_mem);
@@ -316,8 +320,8 @@ __global__ void flash_attn_bw(T* dO, const T *Q, const T* K, const T* V, T* O, T
                 }
             }
             // always true for threadIdx.y < bc
-            // load l and m to on-chip memory only when j > 0
-            if (threadIdx.x == 0 && j > 0){
+            // load l and m to on-chip memory
+            if (threadIdx.x == 0){
                 shared_l[threadIdx.y] = L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)]; 
                 shared_m[threadIdx.y] = M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)];
             }
@@ -358,14 +362,23 @@ __global__ void flash_attn_bw(T* dO, const T *Q, const T* K, const T* V, T* O, T
             __syncthreads();
             // calculate dq
             for (int k = 0; k < head_dim; ++k){
+                // dqi
                 shared_dq[threadIdx.y * head_dim + k] += shared_ds[threadIdx.y * bc + threadIdx.x] * shared_k[threadIdx.x * head_dim + k] * rsqrtf(head_dim);
+            }
+            // write back to HBM dq
+            for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
+                int ele_idx = threadIdx.x * qo_per_thread + col_idx;
+                if (ele_idx < head_dim){
+                    dQ[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx] = shared_dq[threadIdx.y * head_dim + ele_idx];
+                }
             }
             // calculate dk
             for (int k = 0; k < head_dim; ++k){
+                // dkj
                 shared_dk[threadIdx.x * head_dim + k] += shared_ds[threadIdx.y * bc + threadIdx.x] * shared_q[threadIdx.y * head_dim + k] * rsqrtf(head_dim);
             }
             __syncthreads();
-        // write back to global memory, dv, dk
+        // write back to HBM, dv, dk
         for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
             int ele_idx = threadIdx.y * kv_per_thread + col_idx;
             if (ele_idx < head_dim){
@@ -374,7 +387,92 @@ __global__ void flash_attn_bw(T* dO, const T *Q, const T* K, const T* V, T* O, T
             }
         }
         __syncthreads();
-}
+        } // end of inner loop
+    } // end of outer loop
+} // flash_attn_bw
+
+extern "C" {
+void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, const float *Q, const float* K, const float * V, const float * O,
+                                const float *L, const float *M,
+                                int batch_size, int nhead, int seq_len, int head_dim,
+                                bool is_causal,
+                                cudaStream_t stream) {
+
+    int float_size = sizeof(float);
+    int qkv_size = batch_size * nhead * seq_len * head_dim * float_size;
+    int lm_size = batch_size * nhead * seq_len * float_size;
+
+    float *d_q, *d_k, *d_v, *d_o;
+    float *grad_q, *grad_k, *grad_v, *grad_o;
+    float * d_l, *d_m;
+    cudaMalloc((void **)&d_q, qkv_size);
+    cudaMalloc((void **)&d_k, qkv_size);
+    cudaMalloc((void **)&d_v, qkv_size);
+    cudaMalloc((void **)&d_o, qkv_size);
+    cudaMalloc((void **)&d_l, lm_size);
+    cudaMalloc((void **)&d_m, lm_size);
+    cudaMalloc((void **)&grad_q, qkv_size);
+    cudaMalloc((void **)&grad_k, qkv_size);
+    cudaMalloc((void **)&grad_v, qkv_size);
+    cudaMalloc((void **)&grad_o, qkv_size);
+    // cudaMemset(d_l, 0, lm_size);
+    // cudaMemset(d_m, 0, lm_size);
+
+    cudaMemcpy(d_q, Q, qkv_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, K, qkv_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, V, qkv_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_l, L, lm_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_m, M, lm_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(grad_o, dO, qkv_size, cudaMemcpyHostToDevice);
+
+    dim3 grid_dim(nhead, batch_size);
+
+    // get shared memory size M
+    cudaDeviceProp prop;
+    int deviceId;
+    cudaGetDevice(&deviceId);
+    cudaGetDeviceProperties(&prop, deviceId);
+    int Mem = prop.sharedMemPerBlock;
+
+    // calculate block size
+    int bc, br;
+    bc = min(Mem/(4*head_dim), 16);
+    br = min(Mem/(4*head_dim), 16);
+
+    dim3 block_dim(bc, br);
+
+    // launch kernel
+    int total_shared_mem_size = ((br * 4 + bc * 2) * head_dim + br * 3 + br * bc) * float_size;
+    printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
+
+    flash_attn_bw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(grad_q, grad_k, grad_v, grad_o, d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
+    // Synchronize and check for errors
+    cudaDeviceSynchronize();
+    // Check CUDA execution
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "launch_attn_softmax_bw Error: %s\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+    // Copy back to the host
+    cudaMemcpy(dQ, grad_q, qkv_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(dK, grad_k, qkv_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(dV, grad_v, qkv_size, cudaMemcpyDeviceToHost);
+
+    // Free memory on device
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_o);
+    cudaFree(d_l);
+    cudaFree(d_m);
+    cudaFree(grad_q);
+    cudaFree(grad_k);
+    cudaFree(grad_v);
+    cudaFree(grad_o);
+
+} // launch_attn_softmax_bw
+} // extern "C"
     
-}
-}
+    } // namespace cuda
+    } // namespace flash_attn

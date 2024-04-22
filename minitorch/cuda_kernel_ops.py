@@ -516,8 +516,13 @@ class CudaKernelOps(TensorOps):
         batch_size, nhead, seq_len, head_dim = k.shape
         stream = torch.cuda.current_stream().cuda_stream
         output = q.zeros(q.shape)
+        l = q.zeros((batch_size, nhead, seq_len))
+        m = q.zeros((batch_size, nhead, seq_len))
+
 
         lib_flash_attn.launch_flash_attn_fw.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
@@ -537,6 +542,8 @@ class CudaKernelOps(TensorOps):
             k._tensor._storage,
             v._tensor._storage,
             output._tensor._storage,
+            l._tensor._storage,
+            m._tensor._storage,
             batch_size,
             nhead,
             seq_len,
@@ -545,13 +552,53 @@ class CudaKernelOps(TensorOps):
             stream
         )
 
-        return output
+        return output, l, m
 
     @staticmethod
-    def flash_attn_bw(q):
-        return q
+    def flash_attn_bw(grad_out: Tensor, q: Tensor, k: Tensor, v: Tensor, output: Tensor, l: Tensor, m: Tensor, is_causal:Tensor):
+        batch_size, nhead, seq_len, head_dim = k.shape
+        stream1 = torch.cuda.current_stream().cuda_stream
+        grad_q = q.zeros(q.shape)
+        grad_k = k.zeros(k.shape)
+        grad_v = v.zeros(v.shape)
 
+        lib_flash_attn.launch_flash_attn_bw.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_bool,
+            ctypes.c_void_p
+        ]
+        is_causal_bool = is_causal.to_numpy().astype(bool)
 
-
-
-      
+        lib_flash_attn.launch_flash_attn_bw.restype = None
+        lib_flash_attn.launch_flash_attn_bw(
+            grad_q._tensor._storage,
+            grad_k._tensor._storage,
+            grad_v._tensor._storage,
+            grad_out._tensor._storage,
+            q._tensor._storage,
+            k._tensor._storage,
+            v._tensor._storage,
+            output._tensor._storage,
+            l._tensor._storage,
+            m._tensor._storage,
+            batch_size,
+            nhead,
+            seq_len,
+            head_dim,
+            is_causal_bool,
+            stream1
+        )
+        return grad_q, grad_k, grad_v

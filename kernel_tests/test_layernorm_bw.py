@@ -86,7 +86,6 @@ def test_launch_layernorm_bw():
 
     return custom, baseline
 
-
 kt.init(device='cuda:0', nhead=8)
 kt.run(
   'test_launch_layernorm_bw'

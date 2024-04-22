@@ -22,8 +22,8 @@ def test_launch_flash_attn():
   seq_len = 128
   head_dim = 64
   print(
-      "(batch_size, nhead, seq_len, head_dim)"
-      f"): ({batch_size}, {nhead}, {seq_len},{head_dim}"
+      "(batch_size, nhead, seq_len, head_dim"
+      f"): ({batch_size}, {nhead}, {seq_len},{head_dim})"
   )
   q = kt.rand((batch_size, nhead, seq_len, head_dim))
   k = kt.rand((batch_size, nhead, seq_len, head_dim))
