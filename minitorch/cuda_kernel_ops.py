@@ -601,4 +601,4 @@ class CudaKernelOps(TensorOps):
             is_causal_bool,
             stream1
         )
-        return grad_q, grad_k, grad_v
+        return grad_q, grad_k, grad_v, 0

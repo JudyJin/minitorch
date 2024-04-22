@@ -24,7 +24,7 @@ __device__ T* GetSharedPtr(T * shared_mem, int * ptr_bias, int mem_size) {
 
 
 template <typename T>
-__global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T* M, int seq_len, int head_dim,const T * masks, bool is_causal) {
+__global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T* M, T* attn_mask, int seq_len, int head_dim,const T * masks, bool is_causal) {
     int batch_id = blockIdx.y;
     int head_id = blockIdx.x;
     int batch_size = gridDim.y;
@@ -60,6 +60,7 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
     T* shared_m_ij = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_m_new = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_s = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
+    T* shared_mask = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
     for (int j=0;j<outer_steps;++j){
         int row_KV = (j * bc + threadIdx.x);
         // load KV to on-chip memory
@@ -237,7 +238,8 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   int total_shared_mem_size = ((br * 2 + bc * 2) * head_dim + br * 6 + br * bc) * float_size;
   printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
 
-  flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
+//   flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
+  flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, nullptr, seq_len,head_dim, nullptr, is_causal);
   
   // Synchronize and check for errors
   cudaDeviceSynchronize();
@@ -302,7 +304,7 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
     T* shared_ds = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
     T* shared_dp = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
     T* shared_d = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
-
+    // printf("finish initializing shared memory\n");
     for (int j=0;j<outer_steps;++j){
         // load KV to on-chip memory
         // initialize dk, dv = 0 in shared memory
@@ -313,30 +315,40 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
             if (ele_idx < head_dim){
                 shared_k[threadIdx.x * head_dim + ele_idx] = K[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
                 shared_v[threadIdx.x * head_dim + ele_idx] = V[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
+                // printf("loading kv to on-chip memory\n");
                 shared_dk[threadIdx.x * head_dim + ele_idx] = 0;
+                // printf("loading dk to on-chip memory\n");
                 shared_dv[threadIdx.x * head_dim + ele_idx] = 0;
+                // printf("loading dv to on-chip memory\n");
             }
         }
+        // printf("finish loading kv to on-chip memory\n");
         __syncthreads();
         // inner loop
         for (int i = 0;i<inner_steps;++i){
             //load Q to on-chip memory
+
             int qo_per_thread = (head_dim + bc -1) / bc;
             for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
                 int ele_idx = threadIdx.x * qo_per_thread + col_idx;
                 if (ele_idx < head_dim){
                     shared_q[threadIdx.y * head_dim + ele_idx] = Q[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
                     shared_o[threadIdx.y * head_dim + ele_idx] = O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
-                    shared_dq[threadIdx.y * head_dim + ele_idx] = 0;
+                    // printf("loading q to on-chip memory\n");
+                    shared_dq[threadIdx.y * head_dim + ele_idx] = dQ[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
+                    // printf("loading dq to on-chip memory\n");
                     shared_do[threadIdx.y * head_dim + ele_idx] = dO[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
+                    // printf("loading do to on-chip memory\n");
                 }
             }
+            // printf("finish loading q to on-chip memory\n");
             // always true for threadIdx.y < bc
             // load l and m to on-chip memory
             if (threadIdx.x == 0){
                 shared_l[threadIdx.y] = L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)]; 
                 shared_m[threadIdx.y] = M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)];
             }
+            // printf("finish loading l and m to on-chip memory\n");
             __syncthreads();
             // compute attention
             T sum_ = 0;
@@ -344,39 +356,63 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
                 sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
             }
             shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
-            
+            // printf("finish computing attention\n");
             __syncthreads();
 
             // TODO: Add mask
 
             // calculate p
             shared_p[threadIdx.y * bc + threadIdx.x] = __expf(shared_s[threadIdx.y * bc + threadIdx.x] - shared_m[threadIdx.y]) / shared_l[threadIdx.y];
-
+            // printf("finish computing p\n");
             // TODO: Add dropout
-
+            
             // calcluate dv
-            for (int k = 0; k < head_dim; ++k){
-                shared_dv[threadIdx.x * head_dim + k] += shared_d[threadIdx.y * head_dim + k] * shared_p[threadIdx.y * bc + threadIdx.x]; //* rsqrtf(head_dim);
+            for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
+                int ele_idx = threadIdx.y * kv_per_thread + col_idx;
+                if (ele_idx < head_dim){
+                    sum_ = 0;
+                    for (int k = 0; k < br; ++k){
+                        sum_ += shared_p[k * bc + threadIdx.x] * shared_do[k * head_dim + ele_idx];
+                    }
+                    shared_dv[threadIdx.x * head_dim + ele_idx] += sum_;
+                }
             }
+            // printf("finish computing dv\n");
             // calcluate dp
-            shared_dp[threadIdx.y * bc + threadIdx.x] = shared_do[threadIdx.y * head_dim + threadIdx.x] * shared_v[threadIdx.x * head_dim + threadIdx.y];  //rsqrtf(head_dim) *
-            __syncthreads();
-
-            // calculate d, rowsum do*o
-            T sum_d = 0;
-            for (int k = 0; k < bc; ++k){
-                sum_d += shared_do[threadIdx.y * head_dim + k] * shared_o[threadIdx.y * head_dim + k];
+            sum_ = 0;
+            for(int k=0;k<head_dim; ++k){
+                sum_ += shared_do[threadIdx.y * head_dim + k] * shared_v[threadIdx.x * head_dim + k];
             }
-            shared_d[threadIdx.y] = sum_d;
+            shared_dp[threadIdx.y * bc + threadIdx.x] = sum_;
+            __syncthreads();
+            // printf("finish computing dp\n");
+            // calculate d, rowsum do*o
+            if (threadIdx.x == 0){
+                sum_ = 0;
+                for (int k = 0; k < head_dim; ++k){
+                    sum_ += shared_do[threadIdx.y * head_dim + k] * shared_o[threadIdx.y * head_dim + k];
+                }
+                shared_d[threadIdx.y] = sum_;
+            }
+            // printf("finish computing d\n");
+            __syncthreads();
             // calculate ds
             shared_ds[threadIdx.y * bc + threadIdx.x] = shared_p[threadIdx.y * bc + threadIdx.x] * (shared_dp[threadIdx.y * bc + threadIdx.x] - shared_d[threadIdx.y]);
-
+            // printf("finish computing ds\n");
             __syncthreads();
             // calculate dq
-            for (int k = 0; k < head_dim; ++k){
-                // dqi
-                shared_dq[threadIdx.y * head_dim + k] += shared_ds[threadIdx.y * bc + threadIdx.x] * shared_k[threadIdx.x * head_dim + k] * rsqrtf(head_dim);
+            for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
+                int ele_idx = threadIdx.x * qo_per_thread + col_idx;
+                if (ele_idx < head_dim){
+                    T sum_ = 0;
+                    for (int k = 0; k < bc; ++k){
+                        sum_ += shared_ds[threadIdx.y * bc + k] * shared_k[k * head_dim + ele_idx];
+                    }
+                    shared_dq[threadIdx.y * head_dim + ele_idx] += sum_ * rsqrtf(head_dim);
+                }
             }
+            __syncthreads();
+            // printf("finish computing dq\n");
             // write back to HBM dq
             for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
                 int ele_idx = threadIdx.x * qo_per_thread + col_idx;
@@ -384,12 +420,22 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
                     dQ[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx] = shared_dq[threadIdx.y * head_dim + ele_idx];
                 }
             }
-            // calculate dk
-            for (int k = 0; k < head_dim; ++k){
-                // dkj
-                shared_dk[threadIdx.x * head_dim + k] += shared_ds[threadIdx.y * bc + threadIdx.x] * shared_q[threadIdx.y * head_dim + k] * rsqrtf(head_dim);
-            }
             __syncthreads();
+            // printf("finish writing dq back to HBM\n");
+            // calculate dk
+            for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
+                int ele_idx = threadIdx.y * kv_per_thread + col_idx;
+                if (ele_idx < head_dim){
+                    T sum_ = 0;
+                    for (int k = 0; k < br; ++k) {
+                        sum_ += shared_ds[k * bc + threadIdx.x] * shared_q[k * head_dim + ele_idx];
+                    }
+                    shared_dk[threadIdx.x * head_dim + ele_idx] += sum_ * rsqrtf(head_dim);
+                }
+            }
+            // printf("finish computing dk\n");
+            __syncthreads();
+        } // end of inner loop
         // write back to HBM, dv, dk
         for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
             int ele_idx = threadIdx.y * kv_per_thread + col_idx;
@@ -398,8 +444,7 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
                 dK[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx] = shared_dk[threadIdx.x * head_dim + ele_idx];
             }
         }
-        __syncthreads();
-        } // end of inner loop
+        __syncthreads(); 
     } // end of outer loop
 } // flash_attn_bw
 
@@ -433,6 +478,7 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
     cudaMemcpy(d_q, Q, qkv_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_k, K, qkv_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v, V, qkv_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_o, O, qkv_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_l, L, lm_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_m, M, lm_size, cudaMemcpyHostToDevice);
     cudaMemcpy(grad_o, dO, qkv_size, cudaMemcpyHostToDevice);
@@ -454,7 +500,7 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
     dim3 block_dim(bc, br);
 
     // launch kernel
-    int total_shared_mem_size = ((br * 4 + bc * 2) * head_dim + br * 3 + br * bc) * float_size;
+    int total_shared_mem_size = ((br * 4 + bc * 4) * head_dim + br * 3 + 4 * (br * bc)) * float_size;
     printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
 
     flash_attn_bw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(grad_q, grad_k, grad_v, grad_o, d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
