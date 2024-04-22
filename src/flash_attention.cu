@@ -60,14 +60,13 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
     T* shared_m_ij = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_m_new = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_s = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
-
-    // TODO: 1. Consider the case where j=0,e.g., no previous blocks are computed
     for (int j=0;j<outer_steps;++j){
+        int row_KV = (j * bc + threadIdx.x);
         // load KV to on-chip memory
         int kv_per_thread = (head_dim + br -1) / br;
         for (int col_idx = 0; col_idx < kv_per_thread; ++col_idx){
             int ele_idx = threadIdx.y * kv_per_thread + col_idx;
-            if (ele_idx < head_dim){
+            if (row_KV < seq_len && ele_idx < head_dim){
                 shared_k[threadIdx.x * head_dim + ele_idx] = K[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
                 shared_v[threadIdx.x * head_dim + ele_idx] = V[batch_id * stride_batch + head_id * stride_head + (j * bc + threadIdx.x) * stride_seq + ele_idx];
             }
@@ -75,43 +74,49 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
         __syncthreads();
         // inner loop
         for (int i = 0;i<inner_steps;++i){
-            //load Q to on-chip memory
+            int row_QO = (i * br + threadIdx.y);
+            //load QO to on-chip memory
             int qo_per_thread = (head_dim + bc -1) / bc;
             for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
                 int ele_idx = threadIdx.x * qo_per_thread + col_idx;
-                if (ele_idx < head_dim){
+                if (row_QO < seq_len && ele_idx < head_dim){
                     shared_q[threadIdx.y * head_dim + ele_idx] = Q[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
                     shared_o[threadIdx.y * head_dim + ele_idx] = O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
                 }
             }
             // always true for threadIdx.y < bc
             // load l and m to on-chip memory only when j > 0
-            if (threadIdx.x == 0 && j > 0){
+            if (row_QO < seq_len && threadIdx.x == 0 && j > 0){
                 shared_l[threadIdx.y] = L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)]; 
                 shared_m[threadIdx.y] = M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)];
             }
             __syncthreads();
             // compute attention
-            T sum_ = 0;
-            for (int k = 0; k < head_dim; ++k){
-                sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
+            if (row_KV < seq_len && row_QO < seq_len){
+                T sum_ = 0;
+                for (int k = 0; k < head_dim; ++k){
+                    sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
+                }
+                shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
             }
-            shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
-            
             __syncthreads();
 
             // row-wise computation for the normalization factors
-            if (threadIdx.x == 0){
+            if (row_QO < seq_len && threadIdx.x == 0){
                 T m_ij_ = -FLT_MAX; // need to be -inf
                 for (int k = 0; k < bc; ++k){
-                    m_ij_ = fmaxf(m_ij_, shared_s[threadIdx.y * bc + k]);
+                   if ((j * bc + k) < seq_len){
+                        m_ij_ = fmaxf(m_ij_, shared_s[threadIdx.y * bc + k]);
+                   }
                 }
                 shared_m_ij[threadIdx.y] = m_ij_;
                 // softmax
                 T l_ij_ = 0;
                 for (int k = 0; k < bc; ++k){
-                    shared_s[threadIdx.y * bc + k] = __expf(shared_s[threadIdx.y * bc + k] - m_ij_);
-                    l_ij_ += shared_s[threadIdx.y * bc + k];
+                    if ((j * bc + k) < seq_len){
+                        shared_s[threadIdx.y * bc + k] = __expf(shared_s[threadIdx.y * bc + k] - m_ij_);
+                        l_ij_ += shared_s[threadIdx.y * bc + k];
+                    }
                 }
                 shared_l_ij[threadIdx.y] = l_ij_; //Todo: the shared memory for lij is is actually not needed
 
@@ -138,34 +143,41 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
             // step 1: compute the shared_o
             T factor_o = shared_l[threadIdx.y] * __expf(shared_m[threadIdx.y] - shared_m_new[threadIdx.y]) / shared_l_new[threadIdx.y];
             T factor_pv = __expf(shared_m_ij[threadIdx.y] - shared_m_new[threadIdx.y]) / shared_l_new[threadIdx.y];
-            for (int col_idx = 0;col_idx<qo_per_thread; ++col_idx){
-                int ele_idx = threadIdx.x * qo_per_thread + col_idx;
-                if (ele_idx < head_dim){
-                    T sum_pv = 0;
-                    for (int k = 0; k<bc; ++k){
-                        sum_pv += shared_s[threadIdx.y * bc + k] * shared_v[k * head_dim + ele_idx];
-                    }
-                    sum_pv *= factor_pv;
-                    if (j==0){
-                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_pv; // no previous O and normalization for pv
-                    }
-                    else{
-                        T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
-                        shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
+            if (row_QO < seq_len){
+                for (int col_idx = 0;col_idx<qo_per_thread; ++col_idx){
+                    int ele_idx = threadIdx.x * qo_per_thread + col_idx;
+                    if (ele_idx < head_dim){
+                        T sum_pv = 0;
+                        for (int k = 0; k<bc; ++k){
+                            if ((j * bc + k) < seq_len){
+                                sum_pv += shared_s[threadIdx.y * bc + k] * shared_v[k * head_dim + ele_idx];
+                            }
+                        }
+                        sum_pv *= factor_pv;
+                        if (j==0){
+                            shared_o[threadIdx.y * head_dim + ele_idx] = sum_pv; // no previous O and normalization for pv
+                        }
+                        else{
+                            T sum_o = shared_o[threadIdx.y * head_dim + ele_idx] * factor_o + sum_pv;
+                            shared_o[threadIdx.y * head_dim + ele_idx] = sum_o;
+                        }
                     }
                 }
             }
+            
             __syncthreads();
 
             // step 2: write O back to HBM
-            for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
-                int ele_idx = threadIdx.x * qo_per_thread + col_idx;
-                if (ele_idx < head_dim){
-                    O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx] = shared_o[threadIdx.y * head_dim + ele_idx];
+            if (row_QO < seq_len){
+                for (int col_idx = 0; col_idx < qo_per_thread; ++col_idx){
+                    int ele_idx = threadIdx.x * qo_per_thread + col_idx;
+                    if (ele_idx < head_dim){
+                        O[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx] = shared_o[threadIdx.y * head_dim + ele_idx];
+                    }
                 }
             }
             // step 3: write l, m back to HBM
-            if (threadIdx.x==0){
+            if (row_QO < seq_len && threadIdx.x==0){
                 L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)] = shared_l_new[threadIdx.y];
                 M[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)] = shared_m_new[threadIdx.y];
             }
