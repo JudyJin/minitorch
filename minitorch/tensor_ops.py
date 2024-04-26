@@ -251,7 +251,7 @@ class SimpleOps(TensorOps):
     def layernorm_bw():
       raise NotImplementedError("Not implemented in this assignment")
     
-    def flash_attn_fw(q:Tensor, k:Tensor, v:Tensor, is_causal:Tensor):
+    def flash_attn_fw(q:Tensor, k:Tensor, v:Tensor, mask:Tensor, is_causal:Tensor):
         raise NotImplementedError("Not implemented for flashattn")
 
     def flash_attn_bw():

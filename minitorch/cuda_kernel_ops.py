@@ -512,7 +512,7 @@ class CudaKernelOps(TensorOps):
 
     
     @staticmethod
-    def flash_attn_fw(q: Tensor, k: Tensor, v: Tensor, is_causal:Tensor):
+    def flash_attn_fw(q: Tensor, k: Tensor, v: Tensor, mask: Tensor, is_causal:Tensor):
         batch_size, nhead, seq_len, head_dim = k.shape
         stream = torch.cuda.current_stream().cuda_stream
         output = q.zeros(q.shape)
@@ -521,6 +521,7 @@ class CudaKernelOps(TensorOps):
 
 
         lib_flash_attn.launch_flash_attn_fw.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
@@ -544,6 +545,7 @@ class CudaKernelOps(TensorOps):
             output._tensor._storage,
             l._tensor._storage,
             m._tensor._storage,
+            mask._tensor._storage,
             batch_size,
             nhead,
             seq_len,

@@ -454,13 +454,15 @@ class LayerNorm(Function):
 
 class FlashAttn(Function):
     @staticmethod
-    def forward(ctx:Context, q: Tensor, k: Tensor, v:Tensor, is_causal: Tensor) ->Tensor:
-        o, l, m = q.f.flash_attn_fw(q,k,v,is_causal)
-        ctx.save_for_backward(q, k, v, o, l, m, is_causal)
+    def forward(ctx:Context, q: Tensor, k: Tensor, v:Tensor, mask:Tensor, is_causal: Tensor) ->Tensor:
+        o, l, m = q.f.flash_attn_fw(q,k,v,mask,is_causal)
+        ctx.save_for_backward(q, k, v, o, l, m, mask, is_causal)
         return o
     def backward(ctx: Context, out_grad: Tensor) -> Tensor:
-        q, k, v, o, l, m, is_causal = ctx.saved_values
+        q, k, v, o, l, m, mask, is_causal = ctx.saved_values
+        # return q.f.flash_attn_bw(out_grad, q, k, v, o, l, m, mask, is_causal)
         return q.f.flash_attn_bw(out_grad, q, k, v, o, l, m, is_causal)
+        
         
 
 # Helpers for Constructing tensors
