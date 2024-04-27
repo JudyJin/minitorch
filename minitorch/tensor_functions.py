@@ -460,8 +460,7 @@ class FlashAttn(Function):
         return o
     def backward(ctx: Context, out_grad: Tensor) -> Tensor:
         q, k, v, o, l, m, mask, is_causal = ctx.saved_values
-        # return q.f.flash_attn_bw(out_grad, q, k, v, o, l, m, mask, is_causal)
-        return q.f.flash_attn_bw(out_grad, q, k, v, o, l, m, is_causal)
+        return q.f.flash_attn_bw(out_grad, q, k, v, o, l, m, mask, is_causal)
         
         
 

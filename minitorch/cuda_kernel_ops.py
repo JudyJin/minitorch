@@ -557,7 +557,7 @@ class CudaKernelOps(TensorOps):
         return output, l, m
 
     @staticmethod
-    def flash_attn_bw(grad_out: Tensor, q: Tensor, k: Tensor, v: Tensor, output: Tensor, l: Tensor, m: Tensor, is_causal:Tensor):
+    def flash_attn_bw(grad_out: Tensor, q: Tensor, k: Tensor, v: Tensor, output: Tensor, l: Tensor, m: Tensor, mask:Tensor, is_causal:Tensor):
         batch_size, nhead, seq_len, head_dim = k.shape
         stream1 = torch.cuda.current_stream().cuda_stream
         grad_q = q.zeros(q.shape)
@@ -565,6 +565,7 @@ class CudaKernelOps(TensorOps):
         grad_v = v.zeros(v.shape)
 
         lib_flash_attn.launch_flash_attn_bw.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
@@ -596,6 +597,7 @@ class CudaKernelOps(TensorOps):
             output._tensor._storage,
             l._tensor._storage,
             m._tensor._storage,
+            mask._tensor._storage,
             batch_size,
             nhead,
             seq_len,
@@ -603,4 +605,4 @@ class CudaKernelOps(TensorOps):
             is_causal_bool,
             stream1
         )
-        return grad_q, grad_k, grad_v, 0
+        return grad_q, grad_k, grad_v, 0, 0

@@ -24,7 +24,7 @@ __device__ T* GetSharedPtr(T * shared_mem, int * ptr_bias, int mem_size) {
 
 
 template <typename T>
-__global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T* M, int seq_len, int head_dim, const T* attn_mask ,bool is_causal) {
+__global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T* M, const T* attn_mask, int seq_len, int head_dim, bool is_causal) {
     int batch_id = blockIdx.y;
     int head_id = blockIdx.x;
     int nhead = gridDim.x;
@@ -102,7 +102,9 @@ __global__ void flash_attn_fw(const T *Q, const T* K, const T* V, T* O, T* L, T*
                     sum_ += shared_q[threadIdx.y * head_dim + k] * shared_k[threadIdx.x * head_dim + k];
                 }
                 shared_s[threadIdx.y * bc + threadIdx.x] = sum_ * rsqrtf(head_dim) ;
-                shared_s[threadIdx.y * bc + threadIdx.x] += shared_mask[threadIdx.y * bc + threadIdx.x];
+                if (is_causal){
+                    shared_s[threadIdx.y * bc + threadIdx.x] += shared_mask[threadIdx.y * bc + threadIdx.x];
+                }
             }
             __syncthreads();
 
@@ -247,7 +249,7 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
   printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
 
 //   flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
-  flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, d_attn_mask, is_causal);
+  flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, d_attn_mask, seq_len, head_dim, is_causal);
   
   // Synchronize and check for errors
   cudaDeviceSynchronize();
@@ -276,7 +278,7 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
 
 
 template <typename T>
-__global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, const T* K, const T* V, const T* O, const T* L, const T* M, int seq_len, int head_dim, const T * masks, bool is_causal) {
+__global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, const T* K, const T* V, const T* O, const T* L, const T* M, const T* attn_mask, int seq_len, int head_dim, bool is_causal) {
     // flash attention bw function
     int batch_id = blockIdx.y;
     int head_id = blockIdx.x;
@@ -304,8 +306,8 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
     T* shared_do = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * head_dim); // size of (br * head_dim)
     T* shared_l = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
     T* shared_m = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br);
-    T* shared_s_mask = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
     T* shared_s = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
+    T* shared_s_mask = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
     T* shared_p = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
     T* shared_ds = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
     T* shared_dp = GetSharedPtr<T>(shared_mem_start, &ptr_bias, br * bc);
@@ -344,6 +346,10 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
                         shared_do[threadIdx.y * head_dim + ele_idx] = dO[batch_id * stride_batch + head_id * stride_head + (i * br + threadIdx.y) * stride_seq + ele_idx];
                     }
                 }
+                 //load attn_mask to on-chip memory
+                if (row_KV < seq_len){
+                    shared_mask[threadIdx.y * bc + threadIdx.x] = attn_mask[row_QO * seq_len + row_KV];
+                }
 
                 if (threadIdx.x == 0){
                     shared_l[threadIdx.y] = L[batch_id * nhead * seq_len + head_id * seq_len + (i * br + threadIdx.y)]; 
@@ -362,10 +368,11 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
                
                 // TODO: Add mask
                 if (is_causal){
-                    shared_mask[threadIdx.y * bc + threadIdx.x] = masks[threadIdx.y * seq_len + (i * br + threadIdx.x)];
-                    shared_s_mask[threadIdx.y * bc + threadIdx.x] = shared_s[threadIdx.y * bc + threadIdx.x] * shared_mask[threadIdx.y * bc + threadIdx.x];
+                    shared_s_mask[threadIdx.y * bc + threadIdx.x] = shared_s[threadIdx.y * bc + threadIdx.x] + shared_mask[threadIdx.y * bc + threadIdx.x];
                 }
-
+                else{
+                    shared_s_mask[threadIdx.y * bc + threadIdx.x] = shared_s[threadIdx.y * bc + threadIdx.x];
+                }
                 shared_p[threadIdx.y * bc + threadIdx.x] = __expf(shared_s_mask[threadIdx.y * bc + threadIdx.x] - shared_m[threadIdx.y]) / shared_l[threadIdx.y];
             }
             __syncthreads();
@@ -473,7 +480,7 @@ __global__ void flash_attn_bw(T* dQ, T* dK, T* dV, const T* dO, const T *Q, cons
 
 extern "C" {
 void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, const float *Q, const float* K, const float * V, const float * O,
-                                const float *L, const float *M,
+                                const float *L, const float *M, float * attn_mask,
                                 int batch_size, int nhead, int seq_len, int head_dim,
                                 bool is_causal,
                                 cudaStream_t stream) {
@@ -481,10 +488,12 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
     int float_size = sizeof(float);
     int qkv_size = batch_size * nhead * seq_len * head_dim * float_size;
     int lm_size = batch_size * nhead * seq_len * float_size;
+    int attn_mask_size = seq_len * seq_len * float_size;
 
     float *d_q, *d_k, *d_v, *d_o;
     float *grad_q, *grad_k, *grad_v, *grad_o;
-    float * d_l, *d_m;
+    float *d_l, *d_m;
+    float *d_attn_mask;
     cudaMalloc((void **)&d_q, qkv_size);
     cudaMalloc((void **)&d_k, qkv_size);
     cudaMalloc((void **)&d_v, qkv_size);
@@ -495,6 +504,7 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
     cudaMalloc((void **)&grad_k, qkv_size);
     cudaMalloc((void **)&grad_v, qkv_size);
     cudaMalloc((void **)&grad_o, qkv_size);
+    cudaMalloc((void **)&d_attn_mask, attn_mask_size);
 
     cudaMemcpy(d_q, Q, qkv_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_k, K, qkv_size, cudaMemcpyHostToDevice);
@@ -503,6 +513,7 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
     cudaMemcpy(d_l, L, lm_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_m, M, lm_size, cudaMemcpyHostToDevice);
     cudaMemcpy(grad_o, dO, qkv_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_attn_mask, attn_mask, attn_mask_size, cudaMemcpyHostToDevice);
 
     cudaMemset(grad_q, 0, qkv_size);
     cudaMemset(grad_k, 0, qkv_size);
@@ -525,10 +536,10 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
     dim3 block_dim(bc, br);
 
     // launch kernel
-    int total_shared_mem_size = ((br * 4 + bc * 4) * head_dim + br * 3 + 4 * (br * bc)) * float_size;
+    int total_shared_mem_size = ((br * 4 + bc * 4) * head_dim + br * 3 + 6 * (br * bc)) * float_size;
     printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
 
-    flash_attn_bw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(grad_q, grad_k, grad_v, grad_o, d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
+    flash_attn_bw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(grad_q, grad_k, grad_v, grad_o, d_q, d_k, d_v, d_o, d_l, d_m, d_attn_mask, seq_len,head_dim, is_causal);
     // Synchronize and check for errors
     cudaDeviceSynchronize();
     // Check CUDA execution
@@ -553,6 +564,7 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
     cudaFree(grad_k);
     cudaFree(grad_v);
     cudaFree(grad_o);
+    cudaFree(d_attn_mask);
 
 } // launch_attn_softmax_bw
 } // extern "C"
