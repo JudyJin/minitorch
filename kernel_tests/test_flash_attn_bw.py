@@ -17,10 +17,10 @@ backend = minitorch.TensorBackend(CudaKernelOps)
 
 @kt.case(atol=1e-3, rtol=1e-3, ntest=3)
 def test_launch_flash_attn_bw():
-  batch_size = 32
-  nhead = 32
-  seq_len = 128
-  head_dim = 2
+  batch_size = 128
+  nhead = 8
+  seq_len = 256
+  head_dim = 16
   print(
       "(batch_size, nhead, seq_len, head_dim"
       f"): ({batch_size}, {nhead}, {seq_len},{head_dim})"
@@ -102,10 +102,10 @@ def test_launch_flash_attn_bw():
 
 @kt.case(atol=1e-3, rtol=1e-3, ntest=3)
 def test_launch_flash_attn_bw_mask():
-  batch_size = 32
-  nhead = 32
-  seq_len = 300
-  head_dim = 2
+  batch_size = 128
+  nhead = 8
+  seq_len = 256
+  head_dim = 32
   print(
       "(batch_size, nhead, seq_len, head_dim"
       f"): ({batch_size}, {nhead}, {seq_len},{head_dim})"
