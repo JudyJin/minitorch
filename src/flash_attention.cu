@@ -246,7 +246,7 @@ void launch_flash_attn_fw(const float *Q, const float* K, const float * V, float
 
   // launch kernel
   int total_shared_mem_size = ((br * 2 + bc * 2) * head_dim + br * 6 + 2 * br * bc) * float_size;
-  printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
+//   printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
 
 //   flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, seq_len,head_dim, nullptr, is_causal);
   flash_attn_fw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(d_q, d_k, d_v, d_o, d_l, d_m, d_attn_mask, seq_len, head_dim, is_causal);
@@ -537,7 +537,7 @@ void launch_flash_attn_bw(float *dQ, float *dK, float *dV, const float *dO, cons
 
     // launch kernel
     int total_shared_mem_size = ((br * 4 + bc * 4) * head_dim + br * 3 + 6 * (br * bc)) * float_size;
-    printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
+    // printf("here get the M size of %d with br size %d, head_dim %d and shared memory size %d\n", Mem, br,head_dim, total_shared_mem_size);
 
     flash_attn_bw<float><<<grid_dim, block_dim, total_shared_mem_size, stream>>>(grad_q, grad_k, grad_v, grad_o, d_q, d_k, d_v, d_o, d_l, d_m, d_attn_mask, seq_len,head_dim, is_causal);
     // Synchronize and check for errors
