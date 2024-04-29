@@ -10,7 +10,7 @@ import numpy as np
 import argparse
 from distutils.util import strtobool
 import sys
-sys.path.append('/home/zhaojin/wzr/minitorch')  # Adjust path as necessary
+sys.path.append('../minitorch')  # Adjust path as necessary
 
 from sacrebleu.metrics import BLEU
 from transformers import AutoTokenizer

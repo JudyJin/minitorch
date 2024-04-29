@@ -1,5 +1,5 @@
 import numpy as np
-from .tensor import tensor, tensor_from_numpy
+from .tensor import tensor, tensor_from_numpy,zeros_tensor_from_numpy
 from .module import Module, Parameter
 from .modules_basic import (
     Embedding,
@@ -107,12 +107,11 @@ class MultiHeadAttention(Module):
         result = None
         
         if self.use_flash:
-            print("am i here?====11")
             k = kT.permute(0, 1, 3, 2)
-            print("am i here?====")
             if self.causal:
                 mask = self.create_causal_mask(batch_size, self.n_head, queries_len)
-            print("========here of the size",q.shape, k.shape,v.shape,mask.shape)
+            else:
+                mask =zeros_tensor_from_numpy(shape=(1,1,queries_len,queries_len),backend=self.backend)
             result = q.flash_attn(q,k,v,mask,tensor_from_numpy(np.array(1)))
             result.permute(0, 2, 1, 3).contiguous().view(batch_size, queries_len, self.n_head * self.attn_hidden_dim)
 
